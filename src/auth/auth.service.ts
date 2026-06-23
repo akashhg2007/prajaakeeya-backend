@@ -325,7 +325,12 @@ export class AuthService implements OnModuleInit, OnModuleDestroy {
     const hash = (
       (await scryptAsync(loginDto.password, existing.passwordSalt, 64)) as Buffer
     ).toString("hex");
-    if (hash !== existing.passwordHash) {
+    const expected = Buffer.from(existing.passwordHash, "hex");
+    const actual = Buffer.from(hash, "hex");
+    if (
+      expected.length !== actual.length ||
+      !crypto.timingSafeEqual(expected, actual)
+    ) {
       throw new UnauthorizedException("Invalid admin credentials");
     }
 

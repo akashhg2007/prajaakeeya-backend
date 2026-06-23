@@ -865,7 +865,6 @@ export class AspirantsService {
       const voteCount = voteCounts[aspirant.id] ?? 0;
       return this.applyContactPrivacy({
         ...rest,
-        email: user?.email ?? null,
         voteCount,
         votePercentage:
           totalVotes > 0
@@ -1426,11 +1425,21 @@ export class AspirantsService {
    * allowWhatsapp is true. When a flag is false the corresponding field is
    * removed entirely so the value never leaves the server. The allow* flags
    * themselves are preserved so the client knows which contact actions to show.
+   *
+   * Sensitive document URLs (identity cards, address proofs, selfies) are
+   * stripped for non-owner viewers to prevent PII exposure.
    */
   private applyContactPrivacy<T extends Record<string, any>>(aspirant: T): T {
     if (!aspirant) return aspirant;
     if (aspirant.allowPhone === false) delete (aspirant as any).phone;
     if (aspirant.allowWhatsapp === false) delete (aspirant as any).whatsappNumber;
+
+    // Strip sensitive document URLs for non-owner viewers
+    delete (aspirant as any).epicCardUrl;
+    delete (aspirant as any).epicCardBackUrl;
+    delete (aspirant as any).addressProofUrl;
+    delete (aspirant as any).selfieUrl;
+
     return aspirant;
   }
 

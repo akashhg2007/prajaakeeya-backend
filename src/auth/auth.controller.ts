@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  ForbiddenException,
   Get,
   Post,
   Query,
@@ -35,13 +36,24 @@ export class AuthController {
 
   @Post("login")
   @Throttle(AUTH_THROTTLE)
-  @ApiOperation({ summary: "Voter/aspirant login with EPIC ID (returns JWT)" })
+  @ApiOperation({
+    summary: "Voter/aspirant login with EPIC ID (returns JWT)",
+    description:
+      "Deprecated: Use Google OAuth for voter/aspirant login. " +
+      "This endpoint is disabled in production.",
+  })
   @ApiResponse({
     status: 201,
     description: "Login successful, JWT returned",
   })
   @ApiResponse({ status: 404, description: "User not found" })
+  @ApiResponse({ status: 403, description: "Endpoint disabled in production" })
   login(@Body() dto: LoginDto) {
+    if (process.env.NODE_ENV === "production") {
+      throw new ForbiddenException(
+        "EPIC-ID login is disabled. Please use Google OAuth.",
+      );
+    }
     return this.authService.login(dto);
   }
 
