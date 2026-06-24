@@ -35,6 +35,12 @@ import {
   UploadAdminDocumentDto,
   SignDocumentDto,
 } from "../dto/media-upload.dto";
+import {
+  MAX_UPLOAD_BYTES,
+  PROFILE_IMAGE_TYPES,
+  ASPIRANT_DOCUMENT_TYPES,
+} from "../upload.constants";
+import { fileFilter } from "../multer-file-filter";
 
 @ApiTags("Media Upload")
 @Controller("media")
@@ -61,14 +67,19 @@ export class MediaController {
     @Query("key") key: string,
     @Query("expires") expires?: string,
   ) {
-    const exp = expires ? parseInt(expires, 10) : 3600;
+    const exp = Math.min(expires ? parseInt(expires, 10) : 3600, 3600 * 24);
     const url = await this.mediaService.getPresignedUrl(key, exp);
     return { url, expiresIn: exp };
   }
 
   // User profile picture
   @Post("profile-picture")
-  @UseInterceptors(FileInterceptor("file"))
+  @UseInterceptors(
+    FileInterceptor("file", {
+      limits: { fileSize: MAX_UPLOAD_BYTES },
+      fileFilter: fileFilter(PROFILE_IMAGE_TYPES),
+    }),
+  )
   @ApiConsumes("multipart/form-data")
   @ApiOperation({ summary: "Upload or update user profile picture" })
   @ApiBody({
@@ -110,7 +121,12 @@ export class MediaController {
 
   // Aspirant document uploads
   @Post("aspirant/:aspirantId/document")
-  @UseInterceptors(FileInterceptor("file"))
+  @UseInterceptors(
+    FileInterceptor("file", {
+      limits: { fileSize: MAX_UPLOAD_BYTES },
+      fileFilter: fileFilter(ASPIRANT_DOCUMENT_TYPES),
+    }),
+  )
   @ApiConsumes("multipart/form-data")
   @ApiOperation({ summary: "Upload aspirant document (SOP, Agreement, etc.)" })
   @ApiBody({
@@ -208,7 +224,12 @@ export class MediaController {
   // Admin - upload global documents
   @Post("admin/document")
   @Roles("admin")
-  @UseInterceptors(FileInterceptor("file"))
+  @UseInterceptors(
+    FileInterceptor("file", {
+      limits: { fileSize: MAX_UPLOAD_BYTES },
+      fileFilter: fileFilter(ASPIRANT_DOCUMENT_TYPES),
+    }),
+  )
   @ApiConsumes("multipart/form-data")
   @ApiOperation({ summary: "Admin - Upload global document template" })
   @ApiBody({
@@ -284,7 +305,12 @@ export class MediaController {
 
   // User - sign and upload admin document
   @Post("sign-document")
-  @UseInterceptors(FileInterceptor("file"))
+  @UseInterceptors(
+    FileInterceptor("file", {
+      limits: { fileSize: MAX_UPLOAD_BYTES },
+      fileFilter: fileFilter(ASPIRANT_DOCUMENT_TYPES),
+    }),
+  )
   @ApiConsumes("multipart/form-data")
   @ApiOperation({ summary: "Upload signed document" })
   @ApiBody({

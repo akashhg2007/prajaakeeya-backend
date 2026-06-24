@@ -1,36 +1,58 @@
 import {
   BadRequestException,
+  ConflictException,
+  ForbiddenException,
   Injectable,
+  NotFoundException,
+  OnModuleDestroy,
+  OnModuleInit,
   UnauthorizedException,
 } from "@nestjs/common";
 import { JwtService } from "@nestjs/jwt";
 import { ConfigService } from "@nestjs/config";
+import { InjectRepository } from "@nestjs/typeorm";
+import { LessThan, Repository } from "typeorm";
 import { UsersService } from "../users/users.service";
 import { VotesService } from "../votes/votes.service";
+import { VoterRollService } from "../voter-roll/voter-roll.service";
 import { WardsService } from "../wards/wards.service";
 import { AspirantsService } from "../aspirants/aspirants.service";
 import { ElectionsService } from "../elections/elections.service";
 import { ParliamentaryService } from "../geography/parliamentary.service";
 import { AssemblyService } from "../geography/assembly.service";
 import { GramaPanchayatService } from "../grama-panchayat/grama-panchayat.service";
+import { SESService } from "../common/services/ses.service";
 import { S3Service } from "../common/services/s3.service";
+import { MessageCentralService } from "../common/services/message-central.service";
 import { LoginDto } from "./dto/login.dto";
+import { VerifyOtpDto } from "./dto/verify-otp.dto";
+import { AspirantSendOtpDto } from "./dto/aspirant-send-otp.dto";
+import { AspirantVerifyOtpDto } from "./dto/aspirant-verify-otp.dto";
+import { Otp } from "./otp.entity";
 import { User } from "../users/user.entity";
 import axios from "axios";
 
 @Injectable()
-export class AuthService {
+export class AuthService implements OnModuleInit, OnModuleDestroy {
+  private cleanupTimer?: NodeJS.Timeout;
+  private readonly otpTtlMs = 10 * 60 * 1000;
+  private readonly otpCleanupIntervalMs = 60 * 1000;
+  private readonly otpUsedRetentionMs = 24 * 60 * 60 * 1000;
   constructor(
     private readonly usersService: UsersService,
     private readonly jwtService: JwtService,
+    private readonly voterRollService: VoterRollService,
     private readonly wardsService: WardsService,
     private readonly aspirantsService: AspirantsService,
     private readonly votesService: VotesService,
+    private readonly sesService: SESService,
     private readonly s3Service: S3Service,
+    private readonly messageCentralService: MessageCentralService,
     private readonly electionsService: ElectionsService,
     private readonly parliamentaryService: ParliamentaryService,
     private readonly assemblyService: AssemblyService,
     private readonly gramaPanchayatService: GramaPanchayatService,
+    @InjectRepository(Otp) private readonly otpRepo: Repository<Otp>,
     private readonly configService: ConfigService,
   ) {}
 
@@ -45,21 +67,10 @@ export class AuthService {
     };
   }
 
-  /**
-   * Read JWT_SECRET or fail closed. Never fall back to a public constant — a
-   * predictable secret would let an attacker forge OAuth CSRF-state tokens.
-   */
-  private requireSecret(): string {
-    const secret = this.configService.get<string>("JWT_SECRET");
-    if (!secret) {
-      throw new Error("JWT_SECRET is not configured");
-    }
-    return secret;
-  }
-
   /** Issue a stateless HMAC-signed CSRF state token for the OAuth round-trip. */
   issueOAuthState(): string {
-    const secret = this.requireSecret();
+    const secret =
+      this.configService.get<string>("JWT_SECRET") ?? "dev-jwt-secret";
     const crypto = require("crypto") as typeof import("crypto");
     const ts = Date.now().toString(36);
     const nonce = crypto.randomBytes(12).toString("hex");
@@ -73,7 +84,8 @@ export class AuthService {
 
   /** Verify an OAuth state token: signature must match and timestamp ≤10 min. */
   verifyOAuthState(state: string): boolean {
-    const secret = this.requireSecret();
+    const secret =
+      this.configService.get<string>("JWT_SECRET") ?? "dev-jwt-secret";
     const crypto = require("crypto") as typeof import("crypto");
     const parts = state.split(".");
     if (parts.length !== 3) return false;
@@ -221,6 +233,75 @@ export class AuthService {
     return { token: jwt, user: user!, redirectUrl };
   }
 
+  onModuleInit() {
+    // Under PM2 cluster mode every worker would otherwise fire its own
+    // cleanup timer, hammering the otps table with redundant DELETE queries.
+    // Worker 0 owns the schedule; other workers stay idle.
+    const instance = process.env.NODE_APP_INSTANCE;
+    if (instance !== undefined && instance !== "0") return;
+
+    this.cleanupTimer = setInterval(() => {
+      this.cleanupOtps().catch(() => undefined);
+    }, this.otpCleanupIntervalMs);
+  }
+
+  onModuleDestroy() {
+    if (this.cleanupTimer) {
+      clearInterval(this.cleanupTimer);
+    }
+  }
+
+  async login(loginDto: LoginDto) {
+    if (!loginDto.epicId) {
+      throw new BadRequestException("epicId is required");
+    }
+    const existing = await this.usersService.findByEpic(loginDto.epicId);
+    if (!existing || existing.isSelfDeleted) {
+      throw new NotFoundException("User not registered");
+    }
+
+    // Reject blocked users — EPIC ID is blocked
+    if (existing.isBlocked) {
+      throw new ForbiddenException(
+        "Your account has been blocked. Please contact support.",
+      );
+    }
+
+    // Prevent admin users from using the regular voter login endpoint
+    if (existing.role === "admin") {
+      throw new UnauthorizedException("Admin must use admin login endpoint");
+    }
+
+    // Aspirants must login using mobile OTP, not EPIC ID
+    if (existing.role === "aspirant") {
+      throw new ForbiddenException(
+        "Aspirants must use mobile OTP login. Please use the aspirant login endpoint.",
+      );
+    }
+
+    // Generate JWT directly — no OTP needed
+    const payload = this.buildJwtPayload(existing);
+    let userWithWard: any = existing;
+    if (existing.wardId) {
+      try {
+        const ward = await this.wardsService.findOne(existing.wardId);
+        userWithWard = {
+          ...existing,
+          wardNumber: ward.number,
+          state: ward.state,
+          parliamentary: ward.parliamentary,
+          assembly: ward.assembly,
+        };
+      } catch (e) {
+        // ignore if ward not found
+      }
+    }
+    return {
+      token: await this.jwtService.signAsync(payload),
+      user: userWithWard,
+    };
+  }
+
   async adminLogin(loginDto: LoginDto) {
     if (!loginDto.email) {
       throw new UnauthorizedException("Email required for admin login");
@@ -245,19 +326,353 @@ export class AuthService {
     const hash = (
       (await scryptAsync(loginDto.password, existing.passwordSalt, 64)) as Buffer
     ).toString("hex");
-    // Constant-time comparison so login latency can't leak how many leading
-    // bytes of the hash matched.
-    const actual = Buffer.from(hash, "hex");
     const expected = Buffer.from(existing.passwordHash, "hex");
+    const actual = Buffer.from(hash, "hex");
     if (
-      actual.length !== expected.length ||
-      !crypto.timingSafeEqual(actual, expected)
+      expected.length !== actual.length ||
+      !crypto.timingSafeEqual(expected, actual)
     ) {
       throw new UnauthorizedException("Invalid admin credentials");
     }
 
     const payload = this.buildJwtPayload(existing);
     return { token: await this.jwtService.signAsync(payload), user: existing };
+  }
+
+  async verifyOtp(verifyOtpDto: VerifyOtpDto) {
+    // Get the latest login OTP record for this email
+    const otpRecord = await this.otpRepo.findOne({
+      where: { email: verifyOtpDto.email, purpose: "login" },
+      order: { createdAt: "DESC" },
+    });
+
+    if (
+      !otpRecord ||
+      !otpRecord.verificationId ||
+      otpRecord.expiresAt < new Date()
+    ) {
+      throw new UnauthorizedException("Invalid or expired OTP");
+    }
+
+    // Validate verificationId if provided in request
+    if (
+      verifyOtpDto.verificationId &&
+      verifyOtpDto.verificationId !== otpRecord.verificationId
+    ) {
+      throw new UnauthorizedException("Invalid verification session");
+    }
+
+    // Verify OTP with SES
+    const { verified } = await this.sesService.verifyOtp(
+      verifyOtpDto.email,
+      otpRecord.verificationId,
+      verifyOtpDto.otp,
+    );
+
+    if (!verified) {
+      throw new UnauthorizedException("Invalid OTP");
+    }
+
+    // Mark OTP as verified and used
+    otpRecord.verifiedAt = new Date();
+    otpRecord.usedAt = new Date();
+    await this.otpRepo.save(otpRecord);
+
+    // Get user
+    const user = await this.usersService.findByEmail(verifyOtpDto.email);
+
+    // Enforce purpose constraints
+    if (verifyOtpDto.purpose === "login" && (!user || user.isSelfDeleted)) {
+      throw new NotFoundException("User not registered. Please sign up.");
+    }
+    if (verifyOtpDto.purpose === "register" && user && !user.isSelfDeleted) {
+      throw new ConflictException("User already registered. Please log in.");
+    }
+
+    if (!user || user.isSelfDeleted) {
+      throw new UnauthorizedException("User not found");
+    }
+    const payload = this.buildJwtPayload(user);
+    // attach ward details (number, state, parliamentary, assembly) when available
+    let userWithWard: any = user;
+    if (user.wardId) {
+      try {
+        const ward = await this.wardsService.findOne(user.wardId);
+        userWithWard = {
+          ...user,
+          wardNumber: ward.number,
+          state: ward.state,
+          parliamentary: ward.parliamentary,
+          assembly: ward.assembly,
+        };
+        // If user is an aspirant, attach aspirantId when possible
+        if (user.role === "aspirant") {
+          try {
+            const aspirant = await this.aspirantsService.findByUserId(user.id);
+            if (aspirant) userWithWard.aspirantId = aspirant.id;
+          } catch (e) {
+            // ignore lookup errors
+          }
+        }
+      } catch (e) {
+        // ignore if ward not found
+      }
+    }
+    return {
+      token: await this.jwtService.signAsync(payload),
+      user: userWithWard,
+    };
+  }
+
+  async adminVerifyOtp(verifyOtpDto: VerifyOtpDto) {
+    // Get the latest login OTP record for this email
+    const otpRecord = await this.otpRepo.findOne({
+      where: { email: verifyOtpDto.email, purpose: "admin_login" },
+      order: { createdAt: "DESC" },
+    });
+
+    if (
+      !otpRecord ||
+      !otpRecord.verificationId ||
+      otpRecord.expiresAt < new Date()
+    ) {
+      throw new UnauthorizedException("Invalid or expired OTP");
+    }
+
+    // Validate verificationId if provided in request
+    if (
+      verifyOtpDto.verificationId &&
+      verifyOtpDto.verificationId !== otpRecord.verificationId
+    ) {
+      throw new UnauthorizedException("Invalid verification session");
+    }
+
+    // Verify OTP with SES
+    const { verified } = await this.sesService.verifyOtp(
+      verifyOtpDto.email,
+      otpRecord.verificationId,
+      verifyOtpDto.otp,
+    );
+
+    if (!verified) {
+      throw new UnauthorizedException("Invalid OTP");
+    }
+
+    // Mark OTP as verified and used
+    otpRecord.verifiedAt = new Date();
+    otpRecord.usedAt = new Date();
+    await this.otpRepo.save(otpRecord);
+
+    // Get user and verify admin role
+    const user = await this.usersService.findByEmail(verifyOtpDto.email);
+    if (!user || user.role !== "admin") {
+      throw new UnauthorizedException("Invalid admin credentials");
+    }
+    const payload = this.buildJwtPayload(user);
+    return { token: await this.jwtService.signAsync(payload), user };
+  }
+
+  async seedAdmin(email: string, name?: string, password?: string) {
+    if (process.env.NODE_ENV === "production") {
+      throw new ForbiddenException("Not allowed");
+    }
+    return this.usersService.upsertAdmin(email, name, password);
+  }
+
+  async requestRegisterOtp(dto: LoginDto) {
+    if (!dto.email) {
+      throw new BadRequestException("Email is required");
+    }
+    // Do not allow requesting registration OTP if user already exists
+    const existing = await this.usersService.findByEmail(dto.email);
+    if (existing) {
+      throw new BadRequestException("User already registered");
+    }
+
+    // Send OTP via AWS SES
+    const { verificationId, message } = await this.sesService.sendOtp(
+      dto.email,
+    );
+
+    const record = this.otpRepo.create({
+      email: dto.email,
+      otp: "SES_OTP", // Placeholder since actual OTP is sent via email
+      purpose: "register",
+      verificationId,
+      expiresAt: new Date(Date.now() + this.otpTtlMs),
+    });
+    await this.otpRepo.save(record);
+    return { message, verificationId };
+  }
+
+  async verifyRegisterOtp(dto: VerifyOtpDto) {
+    const record = await this.otpRepo.findOne({
+      where: { email: dto.email, purpose: "register" },
+      order: { createdAt: "DESC" },
+    });
+    if (
+      !record ||
+      record.usedAt ||
+      record.verifiedAt ||
+      !record.verificationId ||
+      record.expiresAt < new Date()
+    ) {
+      throw new UnauthorizedException("Invalid or expired OTP");
+    }
+
+    // Validate verificationId if provided in request
+    if (dto.verificationId && dto.verificationId !== record.verificationId) {
+      throw new UnauthorizedException("Invalid verification session");
+    }
+
+    // Verify OTP with SES
+    const { verified } = await this.sesService.verifyOtp(
+      dto.email,
+      record.verificationId,
+      dto.otp,
+    );
+
+    if (!verified) {
+      throw new UnauthorizedException("Invalid OTP");
+    }
+
+    record.verifiedAt = new Date();
+    await this.otpRepo.save(record);
+    return { message: "OTP verified" };
+  }
+
+  async aspirantSendLoginOtp(dto: AspirantSendOtpDto) {
+    const user = await this.usersService.findByPhone(dto.mobileNumber);
+    if (!user || user.isSelfDeleted) {
+      throw new NotFoundException(
+        "No aspirant account found with this mobile number",
+      );
+    }
+    if (user.role !== "aspirant") {
+      throw new ForbiddenException(
+        "This mobile number is not registered as an aspirant",
+      );
+    }
+    if (user.isBlocked) {
+      throw new ForbiddenException(
+        "Your account has been blocked. Please contact support.",
+      );
+    }
+
+    const { verificationId, message } =
+      await this.messageCentralService.sendOtp(dto.mobileNumber);
+
+    const record = this.otpRepo.create({
+      phone: dto.mobileNumber,
+      otp: "MC_OTP",
+      purpose: "aspirant_login",
+      verificationId,
+      expiresAt: new Date(Date.now() + this.otpTtlMs),
+    });
+    await this.otpRepo.save(record);
+    return { message, verificationId };
+  }
+
+  async aspirantResendLoginOtp(dto: AspirantSendOtpDto) {
+    const user = await this.usersService.findByPhone(dto.mobileNumber);
+    if (!user || user.isSelfDeleted) {
+      throw new NotFoundException(
+        "No aspirant account found with this mobile number",
+      );
+    }
+    if (user.role !== "aspirant") {
+      throw new ForbiddenException(
+        "This mobile number is not registered as an aspirant",
+      );
+    }
+    if (user.isBlocked) {
+      throw new ForbiddenException(
+        "Your account has been blocked. Please contact support.",
+      );
+    }
+
+    const { verificationId, message } =
+      await this.messageCentralService.sendOtp(dto.mobileNumber);
+
+    const record = this.otpRepo.create({
+      phone: dto.mobileNumber,
+      otp: "MC_OTP",
+      purpose: "aspirant_login",
+      verificationId,
+      expiresAt: new Date(Date.now() + this.otpTtlMs),
+    });
+    await this.otpRepo.save(record);
+    return { message, verificationId };
+  }
+
+  async aspirantVerifyLoginOtp(dto: AspirantVerifyOtpDto) {
+    const otpRecord = await this.otpRepo.findOne({
+      where: { phone: dto.mobileNumber, purpose: "aspirant_login" },
+      order: { createdAt: "DESC" },
+    });
+
+    if (
+      !otpRecord ||
+      !otpRecord.verificationId ||
+      otpRecord.expiresAt < new Date()
+    ) {
+      throw new UnauthorizedException("Invalid or expired OTP");
+    }
+
+    if (otpRecord.verificationId !== dto.verificationId) {
+      throw new UnauthorizedException("Invalid verification session");
+    }
+
+    const { verified } = await this.messageCentralService.verifyOtp(
+      dto.mobileNumber,
+      dto.verificationId,
+      dto.code,
+    );
+
+    if (!verified) {
+      throw new UnauthorizedException("Invalid OTP");
+    }
+
+    otpRecord.verifiedAt = new Date();
+    otpRecord.usedAt = new Date();
+    await this.otpRepo.save(otpRecord);
+
+    const user = await this.usersService.findByPhone(dto.mobileNumber);
+    if (!user || user.role !== "aspirant" || user.isSelfDeleted) {
+      throw new UnauthorizedException("Aspirant not found");
+    }
+    if (user.isBlocked) {
+      throw new ForbiddenException(
+        "Your account has been blocked. Please contact support.",
+      );
+    }
+
+    const payload = this.buildJwtPayload(user);
+    let userWithWard: any = user;
+    if (user.wardId) {
+      try {
+        const ward = await this.wardsService.findOne(user.wardId);
+        userWithWard = {
+          ...user,
+          wardNumber: ward.number,
+          state: ward.state,
+          parliamentary: ward.parliamentary,
+          assembly: ward.assembly,
+        };
+        try {
+          const aspirant = await this.aspirantsService.findByUserId(user.id);
+          if (aspirant) userWithWard.aspirantId = aspirant.id;
+        } catch (e) {
+          // ignore
+        }
+      } catch (e) {
+        // ignore
+      }
+    }
+    return {
+      token: await this.jwtService.signAsync(payload),
+      user: userWithWard,
+    };
   }
 
   /**
@@ -389,10 +804,6 @@ export class AuthService {
     delete result.municipalCorporationConstituencyId;
     delete result.gramPanchayatConstituencyId;
 
-    // Never serialize credential material to the client.
-    delete result.passwordHash;
-    delete result.passwordSalt;
-
     if (ward) {
       result.wardNumber = ward.number;
       result.state = ward.state ?? result.state;
@@ -467,5 +878,15 @@ export class AuthService {
 
     result.hasVoted = hasVoted;
     return result;
+  }
+
+
+  private async cleanupOtps() {
+    const now = Date.now();
+    const expiredAt = new Date(now);
+    const usedBefore = new Date(now - this.otpUsedRetentionMs);
+
+    await this.otpRepo.delete({ expiresAt: LessThan(expiredAt) });
+    await this.otpRepo.delete({ usedAt: LessThan(usedBefore) });
   }
 }

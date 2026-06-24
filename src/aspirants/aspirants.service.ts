@@ -716,7 +716,24 @@ export class AspirantsService {
     });
   }
 
-  async getVisitResponses(visitId: number) {
+  async getVisitResponses(
+    visitId: number,
+    user?: { id?: number; role?: string },
+  ) {
+    // Verify the visit exists and the user has access
+    const visit = await this.visitRepo.findOne({
+      where: { id: visitId },
+      relations: ["aspirant"],
+    });
+    if (!visit) throw new NotFoundException("Visit not found");
+
+    // Only the aspirant owner or admin can view visit responses
+    if (user && user.role !== "admin" && visit.aspirant?.userId !== user.id) {
+      throw new ForbiddenException(
+        "You do not have permission to view responses for this visit",
+      );
+    }
+
     return this.visitResponseRepo.find({ where: { visitId } });
   }
 
@@ -972,7 +989,6 @@ export class AspirantsService {
       const voteCount = voteCounts[aspirant.id] ?? 0;
       return this.applyContactPrivacy({
         ...rest,
-        email: user?.email ?? null,
         voteCount,
         votePercentage:
           totalVotes > 0
@@ -1533,11 +1549,21 @@ export class AspirantsService {
    * allowWhatsapp is true. When a flag is false the corresponding field is
    * removed entirely so the value never leaves the server. The allow* flags
    * themselves are preserved so the client knows which contact actions to show.
+   *
+   * Sensitive document URLs (identity cards, address proofs, selfies) are
+   * stripped for non-owner viewers to prevent PII exposure.
    */
   private applyContactPrivacy<T extends Record<string, any>>(aspirant: T): T {
     if (!aspirant) return aspirant;
     if (aspirant.allowPhone === false) delete (aspirant as any).phone;
     if (aspirant.allowWhatsapp === false) delete (aspirant as any).whatsappNumber;
+
+    // Strip sensitive document URLs for non-owner viewers
+    delete (aspirant as any).epicCardUrl;
+    delete (aspirant as any).epicCardBackUrl;
+    delete (aspirant as any).addressProofUrl;
+    delete (aspirant as any).selfieUrl;
+
     return aspirant;
   }
 

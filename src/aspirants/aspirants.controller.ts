@@ -8,6 +8,7 @@ import {
   UseGuards,
   Delete,
   Query,
+  Req,
 } from "@nestjs/common";
 import {
   ApiTags,
@@ -404,8 +405,14 @@ export class AspirantsController {
     description: "Visit ID",
     example: 10,
   })
-  getVisitResponses(@Param("visitId") visitId: string) {
-    return this.aspirantsService.getVisitResponses(Number(visitId));
+  getVisitResponses(
+    @Param("visitId") visitId: string,
+    @Req() req: any,
+  ) {
+    return this.aspirantsService.getVisitResponses(
+      Number(visitId),
+      req.user,
+    );
   }
 
   @Delete("meeting")
