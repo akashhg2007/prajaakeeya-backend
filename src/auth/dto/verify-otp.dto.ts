@@ -1,4 +1,4 @@
-import { IsString, IsEmail, Matches, IsOptional } from "class-validator";
+import { IsString, IsEmail, Matches, IsOptional, IsIn } from "class-validator";
 import { ApiProperty } from "@nestjs/swagger";
 
 export class VerifyOtpDto {
@@ -28,4 +28,18 @@ export class VerifyOtpDto {
   @IsString()
   @IsOptional()
   verificationId?: string;
+
+  @ApiProperty({
+    description:
+      "Purpose of the verification (login or register). " +
+      "If 'login', returns 404 for unregistered users. " +
+      "If 'register', returns 409 for already registered users.",
+    example: "login",
+    required: false,
+    enum: ["login", "register"],
+  })
+  @IsString()
+  @IsOptional()
+  @IsIn(["login", "register"])
+  purpose?: "login" | "register";
 }

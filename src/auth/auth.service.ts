@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   Injectable,
   NotFoundException,
@@ -379,6 +380,15 @@ export class AuthService implements OnModuleInit, OnModuleDestroy {
 
     // Get user
     const user = await this.usersService.findByEmail(verifyOtpDto.email);
+
+    // Enforce purpose constraints
+    if (verifyOtpDto.purpose === "login" && (!user || user.isSelfDeleted)) {
+      throw new NotFoundException("User not registered. Please sign up.");
+    }
+    if (verifyOtpDto.purpose === "register" && user && !user.isSelfDeleted) {
+      throw new ConflictException("User already registered. Please log in.");
+    }
+
     if (!user || user.isSelfDeleted) {
       throw new UnauthorizedException("User not found");
     }

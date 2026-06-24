@@ -18,6 +18,7 @@ import {
   ApiParam,
   ApiQuery,
 } from "@nestjs/swagger";
+import { Throttle } from "@nestjs/throttler";
 import { JwtAuthGuard } from "../common/guards/jwt-auth.guard";
 import { RolesGuard } from "../common/guards/roles.guard";
 import { Roles } from "../common/decorators/roles.decorator";
@@ -35,11 +36,15 @@ import { CreateMunicipalityDto } from "../geography/dto/create-municipality.dto"
 import { CreateWardDto } from "../wards/dto/create-ward.dto";
 import { CreateGramaPanchayatDto } from "../grama-panchayat/dto/create-grama-panchayat.dto";
 
+// Stricter throttle for admin endpoints to prevent abuse from compromised sessions
+const ADMIN_THROTTLE = { default: { ttl: 60_000, limit: 60 } };
+
 @ApiTags("Admin")
 @Controller("admin")
 @UseGuards(JwtAuthGuard, RolesGuard)
 @Roles("admin")
 @ApiBearerAuth()
+@Throttle(ADMIN_THROTTLE)
 export class AdminController {
   constructor(private readonly adminService: AdminService) {}
 

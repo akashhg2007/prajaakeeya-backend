@@ -641,7 +641,24 @@ export class AspirantsService {
     };
   }
 
-  async getVisitResponses(visitId: number) {
+  async getVisitResponses(
+    visitId: number,
+    user?: { id?: number; role?: string },
+  ) {
+    // Verify the visit exists and the user has access
+    const visit = await this.visitRepo.findOne({
+      where: { id: visitId },
+      relations: ["aspirant"],
+    });
+    if (!visit) throw new NotFoundException("Visit not found");
+
+    // Only the aspirant owner or admin can view visit responses
+    if (user && user.role !== "admin" && visit.aspirant?.userId !== user.id) {
+      throw new ForbiddenException(
+        "You do not have permission to view responses for this visit",
+      );
+    }
+
     return this.visitResponseRepo.find({ where: { visitId } });
   }
 
