@@ -172,9 +172,12 @@ describe("StatsService — findStatsByConstituency()", () => {
     const result = await service.findStatsByConstituency(4, 22);
 
     expect(result.totalAspirants).toBe(7);
-    expect(aspirantQb.where).toHaveBeenCalledWith("a.electionId = :electionId", {
-      electionId: 4,
-    });
+    expect(aspirantQb.where).toHaveBeenCalledWith(
+      "a.electionId = :electionId",
+      {
+        electionId: 4,
+      },
+    );
     expect(aspirantQb.andWhere).toHaveBeenCalledWith(
       "a.constituencyId = :constituencyId",
       { constituencyId: 22 },
@@ -182,9 +185,12 @@ describe("StatsService — findStatsByConstituency()", () => {
     expect(aspirantQb.andWhere).toHaveBeenCalledWith("a.isActive = :isActive", {
       isActive: true,
     });
-    expect(aspirantQb.andWhere).toHaveBeenCalledWith("a.sopAgreed = :sopAgreed", {
-      sopAgreed: true,
-    });
+    expect(aspirantQb.andWhere).toHaveBeenCalledWith(
+      "a.sopAgreed = :sopAgreed",
+      {
+        sopAgreed: true,
+      },
+    );
     expect(aspirantQb.andWhere).toHaveBeenCalledWith("a.selfieUrl IS NOT NULL");
     expect(aspirantQb.getCount).toHaveBeenCalled();
   });
@@ -201,9 +207,9 @@ describe("StatsService — findStatsByConstituency()", () => {
       },
     });
 
-    await expect(
-      service.findStatsByConstituency(99, 1),
-    ).rejects.toThrow(NotFoundException);
+    await expect(service.findStatsByConstituency(99, 1)).rejects.toThrow(
+      NotFoundException,
+    );
   });
 });
 
